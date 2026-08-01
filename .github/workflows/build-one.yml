@@ -140,6 +140,22 @@ jobs:
             exit 1
           fi
 
+      # Kernel modules as a plain artifact. The firmware tgz only carries
+      # kernel+rootfs, so pulling a single driver out of it means unsquashing
+      # rootfs.squashfs on the developer's machine. When you are iterating on a
+      # .ko (e.g. hot-loading 88x2cu.ko onto a VTX over SSH) that is the only
+      # thing you want, so publish the built modules directly.
+      - name: Upload kernel modules
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmodules-${{ inputs.platform }}-${{ needs.resolve.outputs.short_sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            openipc/output/target/lib/modules/**/*.ko
+            openipc/output/build/rtl88x2cu-openipc-fpv-*/*.ko
+
       - name: Upload firmware
         if: env.NORFW || env.NANDFW
         uses: softprops/action-gh-release@v2
