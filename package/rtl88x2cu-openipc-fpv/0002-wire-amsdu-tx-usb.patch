@@ -1,79 +1,133 @@
-Wire standalone A-MSDU TX into the rtl8822cu USB xmit path (v4).
+Wire standalone A-MSDU TX into the rtl8822cu USB xmit path (v5): N subframes.
 
-Realtek only wired rtw_xmitframe_coalesce_amsdu() into the PCIe xmit path; on USB
-it is dead code with no caller, so the `tx_amsdu` proc knob is inert.
+Realtek only wired rtw_xmitframe_coalesce_amsdu() into the PCIe xmit path, and even
+there it only ever aggregates a PAIR. On USB it has no caller at all, so the
+`tx_amsdu` proc knob is inert.
 
 This is the only aggregation available on this link. The peer is a userspace libusb
-station that cannot emit a compressed BlockAck, so the AP's per-STA
-agg_enable_bitmap stays 0 permanently (80+ issue_addba_req, never established) and
-MAC efficiency sits near 40% of PHY. A-MSDU needs no BlockAck.
+station that cannot emit a compressed BlockAck, so the AP's agg_enable_bitmap stays
+0 permanently (80+ issue_addba_req, never established) and MAC efficiency sits near
+40% of PHY. A-MSDU needs no BlockAck.
 
-Three previous attempts each regressed, all on the same theme -- manipulating the
-xmit queue by hand:
+Changes:
 
-  v1  Hand-rolled the "cannot pair" send: rtw_dump_xframe() on a frame that never
-      went through rtw_xmitframe_coalesce(), so nr_frags/last_txcmdsz and the txdesc
-      were unset. rtw_dump_xframe() submits its URB *inside*
-      `for (t = 0; t < nr_frags; t++)`, so nothing was written and the xmit_buf was
-      never returned by the TX-complete callback -> leak -> pool exhaustion -> 137x
-      "xmit_status_check tx hang", STAs stopped associating.
+1. rtw_xmitframe_coalesce_amsdu() now takes an ARRAY of queued frames instead of
+   one, so N subframes ride in a single MPDU. The per-subframe write was already a
+   self-contained block; it is now simply a loop. Pairs cap efficiency near 64%,
+   whereas 6 subframes (the peer's advertised 7935-byte max A-MSDU) reaches ~84%.
 
-  v2  Fixed that leak (0 hangs) and achieved real pairing -- the receiver saw
-      A-MSDUs with exactly 2 subframes each -- but still hand-rolled the single
-      send, which SILENTLY dropped ~92% of frames (4343 dequeued vs ~355
-      transmitted per 10s, tx_dropped=0, nothing in dmesg): 80% RTP loss, black
-      screen. It also returned _FALSE to implement a 1 ms hold timer, but the caller
-      does `if (ret == _FALSE) break;`, which breaks the whole TX drain loop.
-      Toggling tx_amsdu alone on an otherwise identical module measured 34 Mbps off
-      vs 0.3-0.8 Mbps on.
+2. New rtw_dequeue_xframe_amsdu_n() atomically dequeues 2..N aggregatable frames or
+   nothing, under pxmitpriv->lock, stopping before the 7935-byte cap. All candidates
+   come from one per-STA/per-AC servq, so the RA matches by construction and only
+   the TID is compared.
 
-  v3  Removed both, and returned unpairable frames with rtw_xmitframe_enqueue().
-      That appends at the TAIL, so an EAPOL frame could be sequenced behind a
-      re-enqueued data frame and the station stopped completing the 4-way handshake.
+3. It uses amsdu_ok_locksafe() rather than check_amsdu(). check_amsdu() calls
+   rtw_get_stainfo(), which takes sta_hash_lock; holding that under pxmitpriv->lock
+   is a lock-order inversion that throttled the whole xmit loop to ~12 iterations/s
+   -- only the pre-pass's own aggregates got out, ~240 kbps of a 28 Mbps stream.
+   amsdu_ok_locksafe() replicates every check_amsdu() test except the per-STA
+   WLAN_STA_AMSDU_DISABLE lookup, which nothing in this driver sets.
 
-v4 removes the last piece of hand-rolled queue manipulation. New
-rtw_dequeue_xframe_amsdu_pair() decides and removes atomically under
-pxmitpriv->lock: it either yields two aggregatable frames or leaves the queue
-completely untouched, so frame order is never disturbed and control-plane traffic
-is never displaced. When it yields nothing the pre-pass simply falls through to the
-driver's own aggregation path.
+Subframe count is runtime-tunable so N can be swept without rebuilding:
+  echo 1 > /proc/net/rtl88x2cu/wlan0/tx_amsdu        (enable)
+  echo 6 > /proc/net/rtl88x2cu/wlan0/tx_amsdu_rate   (max subframes; 0/1 => 2)
+tx_amsdu_rate is only read by check_amsdu_tx_support() when tx_amsdu==2, so it is
+free to repurpose. amsdu_debug_timeout counts builds with more than 2 subframes.
 
-Both frames come from the same per-STA/per-AC servq, so the RA matches by
-construction and only the TID is compared (TIDs 0 and 3 both map to BE).
-check_amsdu() already rejects EAPOL/ARP/DHCP/WEP/TKIP and multicast.
-
-Also sets pkt_offset/agg_num before coalescing: coalesce_amsdu() derives
-hw_hdr_offset = TXDESC_SIZE + pkt_offset*PACKET_OFFSET_SZ under
-CONFIG_USB_TX_AGGREGATION, and update_txdesc() uses pkt_offset to decide whether to
-pull the txdesc head. Both were zero in v1/v2.
-
-Still pairs only (2 subframes). The dongle advertises a 7935-byte maximum A-MSDU
-length (HT cap) and 11454-byte maximum MPDU (VHT cap), so up to ~6 subframes would
-fit; extending the builder to N is the next step once this is proven stable.
+Regressions from v1-v4 that this must not reintroduce, all measured on real HW:
+  - Hand-rolled single-frame sends: one leaked the xmit_buf (137x
+    "xmit_status_check tx hang", STAs stopped associating), the other silently
+    dropped ~92% of frames (tx_dropped=0, nothing in dmesg) -> black screen.
+  - Returning _FALSE from the pre-pass: the caller does
+    `if (ret == _FALSE) break;`, which breaks the entire TX drain loop
+    (34 Mbps -> 0.3 Mbps, proven by toggling tx_amsdu alone).
+  - Dequeuing speculatively and putting frames back: rtw_xmitframe_enqueue()
+    appends at the TAIL, pushing EAPOL behind data so the station never completed
+    the 4-way handshake.
+  - Calling check_amsdu() under pxmitpriv->lock (see 3).
 
 --- a/core/rtw_xmit.c
 +++ b/core/rtw_xmit.c
-@@ -4346,6 +4346,101 @@
+@@ -2777,8 +2777,11 @@
+ 	return ret;
+ }
+ 
+-s32 rtw_xmitframe_coalesce_amsdu(_adapter *padapter, struct xmit_frame *pxmitframe, struct xmit_frame *pxmitframe_queue)
++s32 rtw_xmitframe_coalesce_amsdu(_adapter *padapter, struct xmit_frame *pxmitframe,
++		struct xmit_frame **queue_arr, int nqueue)
+ {
++	struct xmit_frame *pxmitframe_queue;
++	int qi;
+ 
+ 	struct pkt_file pktfile;
+ 	struct pkt_attrib *pattrib;
+@@ -2850,8 +2853,15 @@
+ 
+ 	pattrib->last_txcmdsz = pattrib->hdrlen + pattrib->iv_len;
+ 
+-	if(pxmitframe_queue)
++	/* APFPV: append EVERY queued subframe, not just one. Each iteration writes one
++	 * A-MSDU subframe ([DA][SA][len][LLC][payload][pad]) and accumulates
++	 * last_txcmdsz, so N subframes ride in this one MPDU. Realtek only ever passed
++	 * a single frame here, which capped the gain at a pair. */
++	for (qi = 0; qi < nqueue; qi++)
+ 	{
++		pxmitframe_queue = queue_arr[qi];
++		if (!pxmitframe_queue)
++			continue;
+ 		pattrib_queue = &pxmitframe_queue->attrib;
+ 		pkt_queue = pxmitframe_queue->pkt;
+ 
+@@ -4346,6 +4356,141 @@
  }
  #endif
  
 +#ifdef CONFIG_TX_AMSDU
-+/* Atomically dequeue TWO frames that may share one A-MSDU, or dequeue NOTHING.
++/* Subset of check_amsdu() that is safe to call while holding pxmitpriv->lock.
 + *
-+ * Why this exists: the obvious implementation (dequeue one frame, look for a partner, put
-+ * the frame back if there isn't one) reorders the queue, because rtw_xmitframe_enqueue()
-+ * appends at the tail. On an AP that is fatal -- an EAPOL handshake frame can end up
-+ * sequenced behind a re-enqueued data frame, and the station then never completes the
-+ * 4-way. Doing the decision and the removal together under pxmitpriv->lock means the queue
-+ * is only ever modified when we are certain, so frame order is preserved exactly.
++ * check_amsdu() itself calls rtw_get_stainfo(), which takes pstapriv->sta_hash_lock.
++ * Acquiring that under pxmitpriv->lock is a lock-order inversion and in practice throttled
++ * the whole TX engine to ~12 xmit-loop iterations/s (measured: only the pre-pass's own
++ * aggregates got out, ~240 kbps of a 28 Mbps stream). Everything check_amsdu() tests
++ * except that lookup is a plain read of pkt_attrib, so replicate those here. The skipped
++ * test is the per-STA WLAN_STA_AMSDU_DISABLE flag, which nothing in this driver sets. */
++static int amsdu_ok_locksafe(struct xmit_frame *pf)
++{
++	struct pkt_attrib *a;
++
++	if (!pf)
++		return 0;
++	a = &pf->attrib;
++
++	if (!a->qos_en)
++		return 0;
++	if (IS_MCAST(a->ra))
++		return 0;
++	/* EAPOL / ARP / 802.1X-over-LAN / DHCP must never be aggregated: the 4-way
++	 * handshake and address resolution have to keep their own MPDUs. */
++	if ((a->ether_type == 0x888e) || (a->ether_type == 0x0806)
++	    || (a->ether_type == 0x88b4) || (a->dhcp_pkt == 1))
++		return 0;
++	if ((a->encrypt == _WEP40_) || (a->encrypt == _WEP104_) || (a->encrypt == _TKIP_))
++		return 0;
++
++	return 1;
++}
++
++/* Atomically dequeue between 2 and maxn frames that can share ONE A-MSDU, or nothing.
 + *
-+ * Both frames come from the SAME per-STA/per-AC servq, so the RA matches by construction;
-+ * only the TID has to be compared (TIDs 0 and 3 both map to BE). check_amsdu() rejects
-+ * EAPOL/ARP/DHCP/WEP/TKIP and multicast, so control-plane traffic is never aggregated.
++ * All candidates come from the same per-STA/per-AC servq, so the RA matches by
++ * construction and only the TID is compared. Deciding and removing together under
++ * pxmitpriv->lock means the queue is never left reordered -- putting frames back with
++ * rtw_xmitframe_enqueue() appends at the TAIL, which previously pushed an EAPOL frame
++ * behind data and stopped the station completing the 4-way handshake.
 + *
-+ * Returns 1 with *ppfa/*ppfb set (caller owns both frames), else 0 with both NULL. */
-+int rtw_dequeue_xframe_amsdu_pair(struct xmit_priv *pxmitpriv,
-+		struct xmit_frame **ppfa, struct xmit_frame **ppfb)
++ * Stops early when the accumulated A-MSDU would exceed maxlen (the peer advertises a
++ * 7935-byte maximum A-MSDU length in its HT capabilities).
++ *
++ * Returns the number of frames written to out[] (0, or >= 2). */
++int rtw_dequeue_xframe_amsdu_n(struct xmit_priv *pxmitpriv, struct xmit_frame **out,
++		int maxn, int maxlen)
 +{
 +	_irqL irqL0;
 +	_list *sta_plist, *sta_phead, *fr_phead, *fr_plist;
@@ -81,7 +135,6 @@ fit; extending the builder to N is the next step once this is proven stable.
 +	struct hw_xmit *phwxmit;
 +	struct tx_servq *ptxservq = NULL;
 +	_queue *pframe_queue = NULL;
-+	struct xmit_frame *fa = NULL, *fb = NULL;
 +	_adapter *padapter = pxmitpriv->adapter;
 +	struct registry_priv *pregpriv = &padapter->registrypriv;
 +	int i, got = 0;
@@ -91,10 +144,8 @@ fit; extending the builder to N is the next step once this is proven stable.
 +	sint entry = pxmitpriv->hwxmit_entry;
 +#endif
 +
-+	*ppfa = NULL;
-+	*ppfb = NULL;
-+
-+	/* No A-MSDU when wifi_spec is on (matches rtw_get_xframe). */
++	if (maxn < 2)
++		maxn = 2;
 +	if (pregpriv->wifi_spec == 1)
 +		return 0;
 +
@@ -111,36 +162,50 @@ fit; extending the builder to N is the next step once this is proven stable.
 +			pframe_queue = &ptxservq->sta_pending;
 +
 +			if (ptxservq->qcnt >= 2) {
-+				/* Peek the two head frames without touching the list. */
++				struct xmit_frame *cand[16];
++				int ncand = 0, total = 0, prio = -1;
++				int room = maxn > 16 ? 16 : maxn;
++
++				/* Walk the head of this servq WITHOUT touching the list. */
 +				fr_phead = get_list_head(pframe_queue);
 +				fr_plist = get_next(fr_phead);
-+				fa = LIST_CONTAINOR(fr_plist, struct xmit_frame, list);
-+				fr_plist = get_next(fr_plist);
-+				fb = LIST_CONTAINOR(fr_plist, struct xmit_frame, list);
++				while (ncand < room
++				       && rtw_end_of_queue_search(fr_phead, fr_plist) == _FALSE) {
++					struct xmit_frame *pf =
++						LIST_CONTAINOR(fr_plist, struct xmit_frame, list);
++					int sub;
 +
-+				if (fa && fb
-+				    && check_amsdu(fa) == _TRUE && check_amsdu(fb) == _TRUE
-+				    && fa->attrib.priority == fb->attrib.priority) {
-+					/* Commit: remove both, in order. */
-+					rtw_list_delete(&fa->list);
-+					ptxservq->qcnt--;
-+					phwxmit->accnt--;
-+					rtw_list_delete(&fb->list);
-+					ptxservq->qcnt--;
-+					phwxmit->accnt--;
++					if (!amsdu_ok_locksafe(pf))
++						break;
++					if (prio < 0)
++						prio = pf->attrib.priority;
++					else if (pf->attrib.priority != prio)
++						break;
 +
-+					/* Drop the sta node once it has nothing pending (same
-+					 * bookkeeping rtw_dequeue_xframe does). */
++					/* subframe = [DA][SA][len] + LLC/SNAP + payload + pad */
++					sub = ETH_HLEN + 8 + pf->attrib.pktlen + 3;
++					if (ncand && (total + sub) > maxlen)
++						break;
++
++					total += sub;
++					cand[ncand++] = pf;
++					fr_plist = get_next(fr_plist);
++				}
++
++				if (ncand >= 2) {
++					int k;
++
++					for (k = 0; k < ncand; k++) {
++						rtw_list_delete(&cand[k]->list);
++						ptxservq->qcnt--;
++						phwxmit->accnt--;
++						out[k] = cand[k];
++					}
 +					if (_rtw_queue_empty(pframe_queue))
 +						rtw_list_delete(&ptxservq->tx_pending);
-+
-+					*ppfa = fa;
-+					*ppfb = fb;
-+					got = 1;
++					got = ncand;
 +					goto exit;
 +				}
-+				fa = NULL;
-+				fb = NULL;
 +			}
 +			sta_plist = get_next(sta_plist);
 +		}
@@ -157,95 +222,119 @@ fit; extending the builder to N is the next step once this is proven stable.
  	_irqL irqL0;
 --- a/include/rtw_xmit.h
 +++ b/include/rtw_xmit.h
-@@ -1053,6 +1053,8 @@
+@@ -1051,7 +1051,10 @@
+ extern void rtw_amsdu_set_timer(_adapter *padapter, u8 priority);
+ extern void rtw_amsdu_cancel_timer(_adapter *padapter, u8 priority);
  
- extern s32 rtw_xmitframe_coalesce_amsdu(_adapter *padapter, struct xmit_frame *pxmitframe, struct xmit_frame *pxmitframe_queue);	
+-extern s32 rtw_xmitframe_coalesce_amsdu(_adapter *padapter, struct xmit_frame *pxmitframe, struct xmit_frame *pxmitframe_queue);	
++extern s32 rtw_xmitframe_coalesce_amsdu(_adapter *padapter, struct xmit_frame *pxmitframe,
++		struct xmit_frame **queue_arr, int nqueue);
++extern int rtw_dequeue_xframe_amsdu_n(struct xmit_priv *pxmitpriv, struct xmit_frame **out,
++		int maxn, int maxlen);	
  extern s32 check_amsdu(struct xmit_frame *pxmitframe);
-+extern int rtw_dequeue_xframe_amsdu_pair(struct xmit_priv *pxmitpriv,
-+		struct xmit_frame **ppfa, struct xmit_frame **ppfb);
  extern s32 check_amsdu_tx_support(_adapter *padapter);
  extern struct xmit_frame *rtw_get_xframe(struct xmit_priv *pxmitpriv, int *num_frame);
- #endif
 --- a/hal/rtl8822c/usb/rtl8822cu_xmit.c
 +++ b/hal/rtl8822c/usb/rtl8822cu_xmit.c
-@@ -538,6 +538,85 @@
+@@ -538,6 +538,106 @@
  	}
  #endif
  
 +#ifdef CONFIG_TX_AMSDU
-+	/* Standalone A-MSDU pre-pass: pack two pending QoS data MSDUs into ONE MPDU (normal
-+	 * ACK, NOT A-MPDU-gated -- with ampdu_en==0 IS_AMSDU_AMPDU_NOT_VALID is false, i.e.
++	/* Standalone A-MSDU pre-pass: pack N pending QoS data MSDUs into ONE MPDU (normal ACK,
++	 * NOT A-MPDU-gated -- with ampdu_en==0 IS_AMSDU_AMPDU_NOT_VALID is false, i.e.
 +	 * "(0,x): AMPDU not enable, but AMSDU is valid to send"). Realtek only wired the
 +	 * coalesce builder into the PCIe path, so on USB tx_amsdu was inert.
 +	 *
-+	 * This is the only aggregation available here: the peer is a userspace libusb station
-+	 * that cannot emit a compressed BlockAck, so the AP's agg_enable_bitmap stays 0
-+	 * permanently (80+ issue_addba_req, never established) and MAC efficiency sits near
-+	 * 40% of PHY. A-MSDU needs no BlockAck.
++	 * This is the only aggregation available on this link: the peer is a userspace libusb
++	 * station that cannot emit a compressed BlockAck, so the AP's agg_enable_bitmap stays 0
++	 * permanently (80+ issue_addba_req, never established) and MAC efficiency sits near 40%
++	 * of PHY. A-MSDU needs no BlockAck.
 +	 *
-+	 * Three earlier attempts all regressed; keep this loop free of their mistakes:
-+	 *   - Never hand-roll a single-frame send. v1 called rtw_dump_xframe() on a frame that
-+	 *     had not been through rtw_xmitframe_coalesce(), so nr_frags was 0, the URB submit
-+	 *     inside `for (t = 0; t < nr_frags; t++)` never ran, the xmit_buf was never
-+	 *     returned -> leak -> 137x "xmit_status_check tx hang". v2 rebuilt the same path
-+	 *     and it silently dropped ~92% of frames (4343 dequeued vs ~355 transmitted per
-+	 *     10s, tx_dropped=0) -> black screen.
-+	 *   - Never return _FALSE from here. The caller does `if (ret == _FALSE) break;`, which
-+	 *     breaks the entire TX drain loop. v2 used that for a hold timer and throughput
-+	 *     fell from 34 Mbps to 0.3-0.8 Mbps (proven by toggling tx_amsdu alone).
-+	 *   - Never dequeue speculatively and put frames back. v3 did, and rtw_xmitframe_enqueue()
-+	 *     appends at the TAIL, so an EAPOL frame could end up behind a re-enqueued data
-+	 *     frame and the station stopped completing the 4-way handshake.
++	 * Number of subframes is runtime-tunable so N can be swept without a rebuild:
++	 *   echo 1 > /proc/net/rtl88x2cu/wlan0/tx_amsdu        (enable)
++	 *   echo 6 > /proc/net/rtl88x2cu/wlan0/tx_amsdu_rate   (max subframes; 0/1 => 2)
++	 * tx_amsdu_rate is only consulted by check_amsdu_tx_support() when tx_amsdu==2, so it is
++	 * free to repurpose here. The peer advertises a 7935-byte max A-MSDU (HT cap), which is
++	 * the hard cap regardless of this value.
 +	 *
-+	 * rtw_dequeue_xframe_amsdu_pair() therefore decides and removes atomically under
-+	 * pxmitpriv->lock: it yields two aggregatable frames or leaves the queue untouched. If
-+	 * it yields nothing we simply fall through to the driver's own path below. */
++	 * Regressions to not reintroduce (each measured on real HW):
++	 *   - Never hand-roll a single-frame send. Two attempts did: one leaked the xmit_buf
++	 *     (137x "xmit_status_check tx hang"), the other silently dropped ~92% of frames
++	 *     (tx_dropped=0, nothing in dmesg) -> 80% RTP loss -> black screen.
++	 *   - Never return _FALSE from here: the caller does `if (ret == _FALSE) break;`, which
++	 *     breaks the whole TX drain loop (34 Mbps -> 0.3 Mbps).
++	 *   - Never dequeue speculatively and put frames back: rtw_xmitframe_enqueue() appends
++	 *     at the TAIL, which pushed EAPOL behind data and broke the 4-way handshake.
++	 *   - Never call check_amsdu() under pxmitpriv->lock: it takes sta_hash_lock, and the
++	 *     nested lock throttled the xmit loop to ~12 iterations/s (~240 kbps). The dequeue
++	 *     helper uses amsdu_ok_locksafe() instead. */
 +	if (pxmitbuf == NULL && check_amsdu_tx_support(padapter)
 +	    && check_fwstate(&padapter->mlmepriv, WIFI_AP_STATE | WIFI_STATION_STATE)) {
-+		struct xmit_frame *fa = NULL, *fb = NULL;
++		struct xmit_frame *fr[16];
++		int maxn = padapter->tx_amsdu_rate;
++		int n;
 +
-+		if (rtw_dequeue_xframe_amsdu_pair(pxmitpriv, &fa, &fb)) {
++		if (maxn < 2)
++			maxn = 2;
++		if (maxn > 16)
++			maxn = 16;
++
++		n = rtw_dequeue_xframe_amsdu_n(pxmitpriv, fr, maxn, 7935);
++		if (n >= 2) {
++			struct xmit_frame *prim = fr[n - 1];
 +			struct xmit_buf *abuf = rtw_alloc_xmitbuf(pxmitpriv);
 +
 +			if (abuf) {
-+				/* fb is the primary: the A-MSDU is built into ITS buffer and fb is
-+				 * what we dump. Mirror the normal first-frame setup --
-+				 * coalesce_amsdu() derives
++				/* The last frame is the primary: the A-MSDU is built into ITS
++				 * buffer and it is what we dump. Mirror the normal first-frame
++				 * setup -- coalesce_amsdu() derives
 +				 * hw_hdr_offset = TXDESC_SIZE + pkt_offset*PACKET_OFFSET_SZ under
-+				 * CONFIG_USB_TX_AGGREGATION and update_txdesc() uses pkt_offset to
-+				 * decide whether to pull the txdesc head. Leaving these zero was
-+				 * v1/v2 bug #2. */
-+				fb->pxmitbuf = abuf;
-+				fb->buf_addr = abuf->pbuf;
-+				abuf->priv_data = fb;
-+				fb->agg_num = 1;
++				 * CONFIG_USB_TX_AGGREGATION, and update_txdesc() uses pkt_offset to
++				 * decide whether to pull the txdesc head. Leaving these zero built
++				 * the aggregate at the wrong offset in earlier attempts. */
++				int k;
++
++				prim->pxmitbuf = abuf;
++				prim->buf_addr = abuf->pbuf;
++				abuf->priv_data = prim;
++				prim->agg_num = 1;
 +#ifdef CONFIG_TX_EARLY_MODE
-+				fb->pkt_offset = (PACKET_OFFSET_SZ / 8) + 1;
++				prim->pkt_offset = (PACKET_OFFSET_SZ / 8) + 1;
 +#else
-+				fb->pkt_offset = (PACKET_OFFSET_SZ / 8);
++				prim->pkt_offset = (PACKET_OFFSET_SZ / 8);
 +#endif
-+				if (rtw_xmitframe_coalesce_amsdu(padapter, fb, fa) == _SUCCESS) {
-+					/* Both OS packets are copied into abuf now. coalesce_amsdu()
++				if (rtw_xmitframe_coalesce_amsdu(padapter, prim, fr, n - 1)
++						== _SUCCESS) {
++					/* Every OS packet is copied into abuf now. coalesce_amsdu()
 +					 * sets pattrib->nr_frags = 1, which is why this path
 +					 * actually transmits. */
-+					rtw_os_xmit_complete(padapter, fa);
-+					rtw_os_xmit_complete(padapter, fb);
-+					/* fa's payload lives in fb's buffer and fa never owned an
-+					 * xmit_buf: free the frame only. */
-+					rtw_free_xmitframe(pxmitpriv, fa);
++					for (k = 0; k < n; k++)
++						rtw_os_xmit_complete(padapter, fr[k]);
++					/* The non-primary payloads live in the primary's buffer and
++					 * never owned an xmit_buf: free the frames only. */
++					for (k = 0; k < n - 1; k++)
++						rtw_free_xmitframe(pxmitpriv, fr[k]);
++
++					if (n > 2)
++						pxmitpriv->amsdu_debug_timeout++;   /* N>2 builds */
 +					pxmitpriv->amsdu_debug_coalesce_two++;
-+					rtw_dump_xframe(padapter, fb);
++					rtw_dump_xframe(padapter, prim);
 +					return _TRUE;
 +				}
 +				rtw_free_xmitbuf(pxmitpriv, abuf);
-+				fb->pxmitbuf = NULL;
-+				fb->buf_addr = NULL;
++				prim->pxmitbuf = NULL;
++				prim->buf_addr = NULL;
 +			}
 +			/* Only reachable if the xmitbuf pool is exhausted or the build failed --
 +			 * not in steady state -- so this cannot reorder handshake traffic in
-+			 * practice, and both frames are accounted for either way. */
-+			rtw_xmitframe_enqueue(padapter, fa);
-+			rtw_xmitframe_enqueue(padapter, fb);
++			 * practice, and every frame is accounted for either way. */
++			{
++				int k;
++
++				for (k = 0; k < n; k++)
++					rtw_xmitframe_enqueue(padapter, fr[k]);
++			}
 +			pxmitpriv->amsdu_debug_coalesce_one++;
 +		}
 +	}
