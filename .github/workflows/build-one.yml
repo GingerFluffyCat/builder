@@ -178,19 +178,23 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           compression-level: 9
-          # Module.symvers + the build/ scripts are what KSRC needs; drop the object
-          # files and the full source tree we do not need to relink the kernel.
+          # .config is a DOTFILE and upload-artifact skips those by default -- without
+          # this the kernel tree is unusable as a KSRC (no .config = no vermagic).
+          include-hidden-files: true
+          # Module.symvers + the compiled scripts/ host tools (modpost etc.) are what
+          # KSRC needs; we drop the object files and sources we cannot relink anyway.
+          # Directories need /** to recurse -- a bare dir name uploads nothing.
           path: |
             openipc/output/build/linux-*/Module.symvers
             openipc/output/build/linux-*/.config
             openipc/output/build/linux-*/Makefile
-            openipc/output/build/linux-*/include
-            openipc/output/build/linux-*/arch/arm/include
+            openipc/output/build/linux-*/include/**
+            openipc/output/build/linux-*/arch/arm/include/**
             openipc/output/build/linux-*/arch/arm/Makefile
-            openipc/output/build/linux-*/scripts
-            openipc/output/host/bin
-            openipc/output/host/arm-openipc-linux-musleabi/sysroot/usr/include
-            openipc/output/host/lib/gcc
+            openipc/output/build/linux-*/scripts/**
+            openipc/output/host/bin/**
+            openipc/output/host/lib/**
+            openipc/output/host/*/sysroot/usr/include/**
 
       - name: Upload firmware
         if: env.NORFW || env.NANDFW
