@@ -11,6 +11,10 @@ on:
       firmware_ref:
         description: 'OpenIPC/firmware ref (SHA/tag/branch) to clone — for cross-repo bisect of size/regression issues. Defaults to firmware HEAD.'
         required: false
+      devkit:
+        description: 'Also upload the kernel tree + toolchain as a "devkit" artifact, so out-of-tree modules can be rebuilt locally in seconds instead of a full CI build. Large upload; set to "true" only when you need it.'
+        required: false
+        default: 'false'
 
 jobs:
   resolve:
@@ -155,6 +159,38 @@ jobs:
           path: |
             openipc/output/target/lib/modules/**/*.ko
             openipc/output/build/rtl88x2cu-openipc-fpv-*/*.ko
+
+      # One-time "devkit" so out-of-tree modules can be rebuilt LOCALLY in seconds
+      # instead of burning a ~15 min firmware build per iteration. Contains the
+      # configured kernel tree (KSRC) + the cross toolchain, which is everything
+      # `make -C $KSRC M=<mod> modules` needs.
+      #
+      # Safe because this kernel has CONFIG_MODVERSIONS off (the shipped .ko has no
+      # __versions section), so module symbol CRCs do NOT have to match -- only
+      # vermagic, which comes from the kernel tree included here.
+      #
+      # Opt-in: it is a large upload, so only runs when you ask for it.
+      - name: Upload module devkit (kernel tree + toolchain)
+        if: inputs.devkit == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: devkit-${{ inputs.platform }}-${{ needs.resolve.outputs.short_sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 9
+          # Module.symvers + the build/ scripts are what KSRC needs; drop the object
+          # files and the full source tree we do not need to relink the kernel.
+          path: |
+            openipc/output/build/linux-*/Module.symvers
+            openipc/output/build/linux-*/.config
+            openipc/output/build/linux-*/Makefile
+            openipc/output/build/linux-*/include
+            openipc/output/build/linux-*/arch/arm/include
+            openipc/output/build/linux-*/arch/arm/Makefile
+            openipc/output/build/linux-*/scripts
+            openipc/output/host/bin
+            openipc/output/host/arm-openipc-linux-musleabi/sysroot/usr/include
+            openipc/output/host/lib/gcc
 
       - name: Upload firmware
         if: env.NORFW || env.NANDFW
