@@ -1,68 +1,205 @@
+Wire standalone A-MSDU TX into the rtl8822cu USB xmit path (v2).
+
+Realtek only ever wired the A-MSDU coalesce builder and the per-AC hold timers into
+the PCIe xmit path (hal/*/pci/*ce_xmit.c). On USB they are dead code with no caller,
+so the `tx_amsdu` proc knob is inert and the counters never move.
+
+v1 of this patch spammed "RTW: xmit_status_check tx hang" and STAs stopped
+associating. Two distinct bugs, both fixed here:
+
+ (1) XMITBUF LEAK. v1's "could not pair" branch called rtw_dump_xframe() on a frame
+     that had never been through rtw_xmitframe_coalesce(), so pattrib->nr_frags and
+     ->last_txcmdsz were never set and no txdesc was built. rtw_dump_xframe() submits
+     the URB *inside* `for (t = 0; t < pattrib->nr_frags; t++)`, so with nr_frags == 0
+     nothing was written and the xmit_buf was never returned by the TX-complete
+     callback: one leaked xmitbuf per event until the pool was exhausted.
+     Measured on real HW: amsdu_debug_coalesce_one=4, coalesce_two=0, 137 tx-hang
+     prints, wlan0 TX 0 kbps, majestic's UDP socket wedged with 64 KB in Send-Q.
+     Fixed by routing every non-paired frame through one helper that does the FULL
+     normal setup (buffer, agg_num, pkt_offset, coalesce, os_xmit_complete) before
+     dumping. There is now exactly one hand-rolled single-frame path, not two.
+
+ (2) MISSING pkt_offset / agg_num. rtw_xmitframe_coalesce_amsdu() computes
+     hw_hdr_offset = TXDESC_SIZE + (pxmitframe->pkt_offset * PACKET_OFFSET_SZ) under
+     CONFIG_USB_TX_AGGREGATION, and update_txdesc() uses pkt_offset to decide whether
+     to pull the txdesc head. v1 left both zero, so even a successfully coalesced
+     A-MSDU was built at the wrong offset for the USB bulk path.
+
+Also added, and the reason v1 could never have helped even without the hang: the
+realtek tx_amsdu==2 HOLD TIMER. At FPV rates the USB TX queue drains each frame
+before a second one co-queues, so opportunistic pairing never fires (coalesce_two
+stayed 0 = zero aggregation benefit). When exactly one A-MSDU-able frame is queued we
+arm the per-AC 1 ms timer and return without sending; the timeout handler already
+does tasklet_hi_schedule(xmit_tasklet), so a held frame is always re-driven and can
+never stall. Added latency is bounded by 1 ms and only occurs when the queue would
+otherwise be idle.
+
+Correctness note: all subframes of one A-MSDU must share RA and TID.
+rtw_dequeue_xframe() walks the per-AC hwxmit queues and can return frames for
+different stations, so we verify RA + priority before pairing. The PCIe reference
+omits this check; it is harmless with max_num_sta=1 but wrong in general.
+
 diff --git a/hal/rtl8822c/usb/rtl8822cu_xmit.c b/hal/rtl8822c/usb/rtl8822cu_xmit.c
-index 2e2acc1..3562e8e 100644
 --- a/hal/rtl8822c/usb/rtl8822cu_xmit.c
 +++ b/hal/rtl8822c/usb/rtl8822cu_xmit.c
-@@ -538,6 +538,68 @@ static s32 rtl8822cu_xmitframe_complete(PADAPTER padapter, struct xmit_priv *pxm
+@@ -496,6 +496,51 @@
+ 
+ #ifdef CONFIG_USB_TX_AGGREGATION
+ #define IDEA_CONDITION 1	/* check all packets before enqueue */
++
++#ifdef CONFIG_TX_AMSDU
++/* Send one already-dequeued frame the way the normal first-frame path would.
++ * Every field here matters on USB: agg_num must be 1, pkt_offset reserves the
++ * bulk-out block-check offset that update_txdesc() and rtw_xmitframe_coalesce_amsdu()
++ * read back, and rtw_xmitframe_coalesce() is what actually builds the 802.11 header +
++ * txdesc and sets nr_frags/last_txcmdsz. Skipping any of them makes rtw_dump_xframe()
++ * write nothing (its URB submit sits inside `for (t = 0; t < nr_frags; t++)`) and leak
++ * the xmit_buf -- that was the v1 TX hang. Consumes the frame either way. */
++static s32 rtl8822cu_amsdu_send_single(PADAPTER padapter,
++		struct xmit_priv *pxmitpriv, struct xmit_frame *pf)
++{
++	struct xmit_buf *sbuf;
++
++	if (pf == NULL)
++		return _FALSE;
++
++	sbuf = rtw_alloc_xmitbuf(pxmitpriv);
++	if (sbuf == NULL) {
++		rtw_free_xmitframe(pxmitpriv, pf);
++		return _FALSE;
++	}
++
++	pf->pxmitbuf = sbuf;
++	pf->buf_addr = sbuf->pbuf;
++	sbuf->priv_data = pf;
++	pf->agg_num = 1;
++#ifdef CONFIG_TX_EARLY_MODE
++	pf->pkt_offset = (PACKET_OFFSET_SZ / 8) + 1;
++#else
++	pf->pkt_offset = (PACKET_OFFSET_SZ / 8);
++#endif
++
++	if (rtw_xmitframe_coalesce(padapter, pf->pkt, pf) == _FALSE) {
++		rtw_free_xmitbuf(pxmitpriv, sbuf);
++		rtw_free_xmitframe(pxmitpriv, pf);
++		return _FALSE;
++	}
++
++	rtw_os_xmit_complete(padapter, pf);
++	rtw_dump_xframe(padapter, pf);
++	return _TRUE;
++}
++#endif /* CONFIG_TX_AMSDU */
++
+ static s32 rtl8822cu_xmitframe_complete(PADAPTER padapter, struct xmit_priv *pxmitpriv, struct xmit_buf *pxmitbuf)
+ {
+ 	HAL_DATA_TYPE	*pHalData = GET_HAL_DATA(padapter);
+@@ -538,6 +583,113 @@
  	}
  #endif
  
 +#ifdef CONFIG_TX_AMSDU
-+	/* APFPV: wire standalone A-MSDU TX for the USB path. Realtek only ever wired
-+	 * the coalesce builder + AC timers into the PCIe xmit path (rtl8822ce_xmit.c);
-+	 * on USB they were dead code (no caller), so tx_amsdu was inert. Here we
-+	 * coalesce a pair of pending QoS data frames into one A-MSDU MPDU and dump it,
-+	 * before the normal bulk-aggregation path. Gate:
-+	 *   - pxmitbuf == NULL: we own buffer allocation (the buf_handler calls with NULL).
-+	 *   - check_amsdu_tx_support(): tx_amsdu==1, or ==2 above tx_amsdu_rate (proc knobs).
-+	 *   - check_amsdu(): per-frame QoS + unicast + CCMP; with A-MPDU off this is the
-+	 *     standalone-AMSDU-valid case (IS_AMSDU_AMPDU_NOT_VALID is false when ampdu_en==0). */
++	/* Standalone A-MSDU pre-pass: pack two pending QoS data MSDUs into ONE MPDU
++	 * (normal ACK, NOT A-MPDU-gated -- with ampdu_en==0 IS_AMSDU_AMPDU_NOT_VALID is
++	 * false, i.e. "(0,x): AMPDU not enable, but AMSDU is valid to send"). Runs before
++	 * the normal bulk-aggregation path. Gate: pxmitbuf == NULL means we own buffer
++	 * allocation; check_amsdu_tx_support() is the tx_amsdu/tx_amsdu_rate proc knob. */
 +	if (pxmitbuf == NULL && check_amsdu_tx_support(padapter)
 +	    && check_fwstate(&padapter->mlmepriv, WIFI_AP_STATE | WIFI_STATION_STATE)) {
 +		int amsdu_nf = 0;
-+		struct xmit_frame *amsdu_peek = rtw_get_xframe(pxmitpriv, &amsdu_nf);
++		struct xmit_frame *peek = rtw_get_xframe(pxmitpriv, &amsdu_nf);
 +
-+		if (amsdu_peek && amsdu_nf >= 2 && check_amsdu(amsdu_peek)) {
-+			struct xmit_buf *abuf = rtw_alloc_xmitbuf(pxmitpriv);
++		if (peek && check_amsdu(peek)) {
++			u8 amsdu_prio = peek->attrib.priority;
 +
-+			if (abuf) {
-+				struct xmit_frame *fa = rtw_dequeue_xframe(pxmitpriv,
-+						pxmitpriv->hwxmits, pxmitpriv->hwxmit_entry);
++			if (amsdu_nf >= 2) {
++				struct xmit_frame *fa, *fb = NULL;
 +
-+				if (fa) {
-+					fa->pxmitbuf = abuf;
-+					fa->buf_addr = abuf->pbuf;
-+					abuf->priv_data = fa;
++				rtw_amsdu_cancel_timer(padapter, amsdu_prio);
++				rtw_amsdu_set_timer_status(padapter, amsdu_prio,
++						RTW_AMSDU_TIMER_UNSET);
 +
-+					amsdu_peek = rtw_get_xframe(pxmitpriv, &amsdu_nf);
-+					if (amsdu_peek && amsdu_nf >= 1 && check_amsdu(amsdu_peek)) {
-+						struct xmit_buf *bbuf = rtw_alloc_xmitbuf(pxmitpriv);
++				fa = rtw_dequeue_xframe(pxmitpriv, pxmitpriv->hwxmits,
++						pxmitpriv->hwxmit_entry);
++				if (fa == NULL)
++					return _FALSE;
 +
-+						if (bbuf) {
-+							struct xmit_frame *fb = rtw_dequeue_xframe(pxmitpriv,
-+									pxmitpriv->hwxmits, pxmitpriv->hwxmit_entry);
++				/* All subframes of one A-MSDU must share RA and TID.
++				 * rtw_dequeue_xframe() walks the per-AC hwxmit queues and can
++				 * return frames for DIFFERENT stations, which would build an MPDU
++				 * addressed to one STA carrying another STA's payload. The PCIe
++				 * reference omits this check; harmless at max_num_sta=1, wrong
++				 * in general. */
++				peek = rtw_get_xframe(pxmitpriv, &amsdu_nf);
++				if (peek && check_amsdu(peek)
++				    && peek->attrib.priority == fa->attrib.priority
++				    && _rtw_memcmp(peek->attrib.ra, fa->attrib.ra, ETH_ALEN))
++					fb = rtw_dequeue_xframe(pxmitpriv, pxmitpriv->hwxmits,
++							pxmitpriv->hwxmit_entry);
 +
-+							if (fb) {
-+								fb->pxmitbuf = bbuf;
-+								fb->buf_addr = bbuf->pbuf;
-+								bbuf->priv_data = fb;
++				if (fb) {
++					struct xmit_buf *abuf = rtw_alloc_xmitbuf(pxmitpriv);
 +
-+								/* build A-MSDU [fa][fb] into fb's buffer, dump fb */
-+								rtw_xmitframe_coalesce_amsdu(padapter, fb, fa);
-+								rtw_free_xmitframe(pxmitpriv, fa);
-+								rtw_free_xmitbuf(pxmitpriv, abuf);
-+								pxmitpriv->amsdu_debug_coalesce_two++;
-+								rtw_dump_xframe(padapter, fb);
-+								return _TRUE;
-+							}
-+							rtw_free_xmitbuf(pxmitpriv, bbuf);
++					if (abuf) {
++						/* fb is the primary: the A-MSDU is built into ITS
++						 * buffer and fb is what we dump. Same setup as the
++						 * normal first frame so coalesce_amsdu() and
++						 * update_txdesc() agree on the USB header offset. */
++						fb->pxmitbuf = abuf;
++						fb->buf_addr = abuf->pbuf;
++						abuf->priv_data = fb;
++						fb->agg_num = 1;
++#ifdef CONFIG_TX_EARLY_MODE
++						fb->pkt_offset = (PACKET_OFFSET_SZ / 8) + 1;
++#else
++						fb->pkt_offset = (PACKET_OFFSET_SZ / 8);
++#endif
++						if (rtw_xmitframe_coalesce_amsdu(padapter, fb, fa)
++								== _SUCCESS) {
++							/* Both OS packets are copied into abuf now. */
++							rtw_os_xmit_complete(padapter, fa);
++							rtw_os_xmit_complete(padapter, fb);
++							/* fa's payload lives in fb's buffer and fa
++							 * never owned an xmit_buf: free the frame. */
++							rtw_free_xmitframe(pxmitpriv, fa);
++							pxmitpriv->amsdu_debug_coalesce_two++;
++							rtw_dump_xframe(padapter, fb);
++							return _TRUE;
 +						}
++						/* Build failed: fall back to single sends. */
++						rtw_free_xmitbuf(pxmitpriv, abuf);
++						fb->pxmitbuf = NULL;
++						fb->buf_addr = NULL;
 +					}
-+					/* could not pair: send fa as a normal single frame */
 +					pxmitpriv->amsdu_debug_coalesce_one++;
-+					rtw_dump_xframe(padapter, fa);
++					rtl8822cu_amsdu_send_single(padapter, pxmitpriv, fa);
++					rtl8822cu_amsdu_send_single(padapter, pxmitpriv, fb);
 +					return _TRUE;
 +				}
-+				rtw_free_xmitbuf(pxmitpriv, abuf);
++
++				/* No usable partner (different STA/TID, or gone). */
++				pxmitpriv->amsdu_debug_coalesce_one++;
++				return rtl8822cu_amsdu_send_single(padapter, pxmitpriv, fa);
++			} else if (rtw_amsdu_get_timer_status(padapter, amsdu_prio)
++					== RTW_AMSDU_TIMER_UNSET) {
++				/* Exactly one A-MSDU-able frame queued and we have not waited
++				 * yet: hold it up to 1 ms so a partner can arrive. At FPV rates
++				 * the USB queue drains a frame before a second co-queues, which
++				 * is why opportunistic pairing alone never fired (coalesce_two
++				 * stayed 0). Nothing is dequeued here so nothing can leak, and
++				 * the timeout handler does tasklet_hi_schedule(xmit_tasklet), so
++				 * a held frame is always re-driven. */
++				rtw_amsdu_set_timer_status(padapter, amsdu_prio,
++						RTW_AMSDU_TIMER_SETTING);
++				rtw_amsdu_set_timer(padapter, amsdu_prio);
++				pxmitpriv->amsdu_debug_set_timer++;
++				return _FALSE;
++			} else {
++				/* Timer already armed/fired: stop waiting, fall through to the
++				 * normal path and send this frame now. */
++				rtw_amsdu_set_timer_status(padapter, amsdu_prio,
++						RTW_AMSDU_TIMER_UNSET);
++				pxmitpriv->amsdu_debug_timeout++;
 +			}
 +		}
 +	}
